@@ -8,7 +8,7 @@ import sys
 #
 
 @jit(nopython=True, parallel=True)
-def get_neighbor_forces(number_edges, edges, edge_forces, locations, center, types, radius, u_adhesion=1, r_e=1.01, u_repulsion=10000):
+def get_neighbor_forces(number_edges, edges, edge_forces, locations, center, types, radius, u_adhesion, u_repulsion, r_e):
     for index in prange(number_edges):
         # get indices of cells in edge
         cell_1 = edges[index][0]
@@ -27,16 +27,16 @@ def get_neighbor_forces(number_edges, edges, edge_forces, locations, center, typ
             edge_forces[index][1] = 0
         else:
             dist = dist2 ** (1/2)
-            if 0 < dist2 < (2 * radius) ** 2:
+            if 0 < dist < (2 * radius):
                 edge_forces[index][0] = -1 * u_repulsion * (vec / dist)
                 edge_forces[index][1] = 1 * u_repulsion * (vec / dist)
             else:
                 # get the cell type
-                cell_1_type = types[cell_1]
-                cell_2_type = types[cell_2]
+                # cell_1_type = types[cell_1]
+                # cell_2_type = types[cell_2]
                 # get value prior to applying type specific adhesion const
                 value = (dist - r_e) * (vec / dist)
-                edge_forces[index][0] = u_adhesion * value
+                edge_forces[index][0] =  u_adhesion * value
                 edge_forces[index][1] = -1 * u_adhesion * value
     return edge_forces
 
@@ -76,13 +76,13 @@ class MonolayerModel(Simulation):
             "image_quality": 900,
             "video_quality": 900,
             "fps": 12,
-            "E_cell_rad": 0.25,
-            "M_cell_rad": 0.25,
+            "E_cell_rad": 0.5,
+            "M_cell_rad": 0.5,
             "cell_deformation": 0,
             "velocity": 0.05,
             "initial_seed_ratio": 0.5,
             "cell_interaction_rad": 2.4,
-            "cell_rad": 0.25,
+            "cell_rad": 0.5,
             "replication_type": None,
         }
         self.model_parameters(self.default_parameters)
@@ -90,8 +90,8 @@ class MonolayerModel(Simulation):
         self.model_params = model_params
 
         # aba/dox/cho ratio
-        self.E_color = np.array([50, 50, 255], dtype=int) #blue
-        self.M_color = np.array([50, 50, 255], dtype=int)
+        self.E_color = np.array([255, 255, 255], dtype=int) #blue
+        self.M_color = np.array([0, 0, 255], dtype=int)
 
         self.initial_seed_rad = self.well_rad * self.initial_seed_ratio
         self.dim = np.asarray(self.size)
@@ -150,6 +150,7 @@ class MonolayerModel(Simulation):
             
             self.get_neighbors(self.neighbor_graph, self.cell_interaction_rad * self.cell_rad)
             self.move_parallel()
+        self.update_states(0)
         # record initial values
         self.step_values()
         #self.step_image(morphogen_background=self.activator_field)
@@ -164,7 +165,7 @@ class MonolayerModel(Simulation):
             self.get_neighbors(self.neighbor_graph, self.cell_interaction_rad * self.cell_rad)
             # move the cells and track total repulsion vs adhesion forces
             self.move_parallel()
-        self.reproduce(0.1)
+        self.update_states(0.5)
 
         # add/remove agents from the simulation
         self.update_populations()
@@ -234,7 +235,6 @@ class MonolayerModel(Simulation):
         """
         # get indices of hatching/dying agents with Boolean mask
         add_indices = np.arange(self.number_agents)[self.hatching]
-        self.update_colors(add_indices)
         remove_indices = np.arange(self.number_agents)[self.removing]
 
         # count how many added/removed agents
@@ -312,7 +312,7 @@ class MonolayerModel(Simulation):
         if num_edges > 0:
             # get adhesive/repulsive forces from neighbors and gravity forces
             edge_forces = get_neighbor_forces(num_edges, edges, edge_forces, self.locations, self.center, self.cell_type,
-                                            self.cell_rad, u_adhesion=self.u_adhesion, u_repulsion=self.u_repulsion)
+                                            self.cell_rad, u_adhesion=self.u_adhesion, u_repulsion=self.u_repulsion, r_e = 2.02 * self.cell_rad)
             neighbor_forces = convert_edge_forces(num_edges, edges, edge_forces, neighbor_forces)
         noise_vector = self.alpha * np.random.uniform(-1, 1, (self.number_agents, self.dimension))
         for i in range(self.number_agents):
@@ -329,7 +329,7 @@ class MonolayerModel(Simulation):
 
     #Unused..
     @record_time
-    def reproduce(self, ts):
+    def update_states(self, ts):
         """ If the agent meets criteria, hatch a new agent.
         """
         # increase division counter by time step for all agents
@@ -339,21 +339,13 @@ class MonolayerModel(Simulation):
         
         self.division_set[:] += ts
         for index in range(self.number_agents):
+            num_neighbors = sum(self.neighbor_graph.get_adjacency()[index])
             if self.division_set[index] > self.div_thresh[index]:
                 # 6 is the maximum number of cells that can surround a cell
                 #if np.sum(adjacency_matrix[:, index]) < 5:
-                num_neighbors = sum(self.neighbor_graph.get_adjacency()[index])
                 if num_neighbors < 6:
                     self.mark_to_hatch(index)
-                else:
-                    if self.cell_type[index] == 0:
-                        self.colors[index] = [173, 216, 230]
-                    else:
-                        self.colors[index] = [255, 114, 118]
-
-    def update_colors(self, index):
-        ref = np.array([self.M_color, self.E_color])
-        self.colors[index] = ref[self.cell_type[index]]
+            self.colors[index] =np.array([min(max(0, (6-num_neighbors)/6) * 255, 255), min(max(0, (6-num_neighbors)/6) * 255, 255), 255], dtype=int) 
 
     @classmethod
     def simulation_mode_0(cls, name, output_dir):
@@ -436,7 +428,7 @@ class MonolayerModel(Simulation):
 if __name__ == "__main__":
     if sys.platform == 'win32':
         model_params = {
-            "num_to_start": 1000,
+            "num_to_start": 400,
             "alpha": 0.5,
             "end_step": 36,
             "sub_ts": 1,
@@ -451,7 +443,7 @@ if __name__ == "__main__":
     elif sys.platform == 'darwin':
         model_params = {
             "num_to_start": 1000,
-            "alpha": 0.5,
+            "alpha": 0.05,
             "end_step": 36,
             "sub_ts": 1,
             "E_ratio": 1,
