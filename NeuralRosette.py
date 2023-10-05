@@ -18,25 +18,27 @@ def get_gravity_forces(number_cells, locations, center, well_rad, net_forces):
     return net_forces
 
 
-def get_neighbor_forces(edge_forces, num_agents, locations, edge_locations, radii, center):
+def get_neighbor_forces(edge_forces, num_agents, contacts, locations, edge_locations, radii, center, u_rep=10):
     # Construct polygons:
     poly_list = getPolygons(num_agents, edge_locations, center)
     for i in range(num_agents):
         vecs, dist, overlap, interaction = check_overlap_poly(locations[i], np.vstack((locations[:i], locations[i+1:])), 
-                                                              poly_list[i], poly_list[:i] + poly_list[i+1:], center, radii[i] * 3.2)
+                                                              poly_list[i], poly_list[:i] + poly_list[i+1:], center, radii[i])
         #vecs, dist, overlap, interaction = check_overlap(locations[i], locations, center, radii[i] * 2, radii[i] * 3.2)
-        net_force_repulsion = np.sum((vecs / dist * overlap), axis=0)
+        net_force_repulsion = u_rep * np.sum((vecs / dist * overlap), axis=0)
         magnitude_repulsion = np.sqrt(np.sum(np.square(net_force_repulsion)))
         #magnitude = np.sqrt(np.sum(np.square(net_force)))
         net_force_attraction = np.sum((vecs[interaction] / dist[interaction].reshape((len(dist[interaction]), 1))),
                                       axis=0)
-        magnitude_attraction = 10 * np.sqrt(np.sum(np.square(net_force_attraction)))
+        magnitude_attraction = np.sqrt(np.sum(np.square(net_force_attraction)))
         if magnitude_attraction == 0:
             edge_forces[i] = 0
         else:
             edge_forces[i] = -1 * net_force_repulsion + net_force_attraction
             edge_forces[i] = edge_forces[i] / (magnitude_repulsion + magnitude_attraction)
-    return edge_forces
+        overlap[overlap > 0] = 1
+        contacts[i] = np.sum(overlap)
+    return edge_forces, contacts
 #weigh cells more for attraction
 
 def getPolygons(num_cells, edge_locations, center):
@@ -100,8 +102,22 @@ def rotate(point, theta, center):
     R = np.array(((c, -s), (s, c))).transpose()
     return np.matmul(point-center, R) + center
 
-def seed_cells_square(num_agents, radius, edge=2):
-    return (radius - 2 * edge) * np.random.rand(num_agents, 2) + edge
+def RandomWalkXYZ(N, d):
+    random_walk = np.random.uniform(low=-0.5, high=0.5, size=(N,d))
+    return np.cumsum(random_walk, axis=0)
+
+def seed_cells_sphere(center, W, N=50, d=2):
+    """
+    :param center: center of sphere. Likely that we would want this to be the center of the simulation space.
+    :param W: number of cells
+    :param N: number of "steps" to take of random walk. Related to how dense we want our sphere to be
+    :param d: the dimensions of the model. d=3 is 3d, d=2 is 2d
+    """
+    endpoints = np.zeros((W, d))
+    for i in range(W):
+        endpoints[i] = RandomWalkXYZ(N, d)[-1, :]
+    return endpoints + center
+
 
 
 def area_constraint(area, major_axis):
@@ -136,7 +152,7 @@ class NeuralRosette(Simulation):
         self.agent_types = dict()
 
         # default values which can be updated in the subclass
-        self.num_to_start = 53
+        self.num_to_start = 112
         self.cuda = False
         self.end_step = 30
         self.size = [300, 300, 0]
@@ -151,7 +167,7 @@ class NeuralRosette(Simulation):
         self.diff_color = np.array([255, 50, 50], dtype=int) #red
         self.transition_color = np.array([191, 64, 191], dtype=int) #purple
         self.stem_color = np.array([50, 50, 255], dtype=int) #blue
-        self.velocity = .3
+        self.velocity = .05
         self.cell_interaction_rad = 3.2
         self.min_cell_size = 5
         self.max_cell_size = 10
@@ -168,10 +184,10 @@ class NeuralRosette(Simulation):
         self.add_agents(0, agent_type="D")
 
         self.indicate_arrays("locations", "major_axis", "minor_axis", "colors", "cell_type", "division_set", "division_threshold",
-                             "diff_set", "diff_threshold", "cAMP_conc", "orientations")
+                             "diff_set", "diff_threshold", "orientations", "contacts")
         #self.locations = seed_cells_square(self.num_to_start, 1000, 2)
         #centerr = [self.size[1]/2, self.size[2]/2]
-        self.locations = seed_cells(self.num_to_start, self.center, 170)
+        self.locations = seed_cells_sphere(self.center, self.num_to_start, N=10000)
         self.locations = np.where(self.locations > 300, 300, self.locations)
         self.locations = np.where(self.locations < 0, 0, self.locations)
 
@@ -210,16 +226,14 @@ class NeuralRosette(Simulation):
         self.diff_threshold = self.agent_array(initial={"S": lambda: 1,
                                                         "T": lambda: -1,
                                                         "D": lambda: -1})
+        self.contacts = self.agent_array(initial=lambda:0)
         self.indicate_graphs("neighbor_graph")
         self.neighbor_graph = self.agent_graph()
-
-        self.cAMP_conc = self.agent_array(initial={"S": lambda: np.random.uniform(0, 37),
-                                                   "T": lambda: 0,
-                                                   "D": lambda: 0})
-        self.cAMP_field = np.zeros((self.size[0], self.size[1]))
-
+        for _ in range(80):
+            self.move()
         self.step_values()
         self.step_image()
+
 
 
     def step(self):
@@ -227,10 +241,7 @@ class NeuralRosette(Simulation):
             Must be overridden.
         """
     # Difference in timescales
-        for _ in range(10):
-            # temporarily disabled so that I can see the cells stretch.
-            self.move()
-            pass
+        self.move()
         self.stretch_cells()
         #update up here
         self.step_values()
@@ -333,21 +344,21 @@ class NeuralRosette(Simulation):
     def move(self):
         #image_center = [self.size[1]/2, self.size[2]/2]
         neighbor_forces = np.zeros((self.number_agents, 2))
-        neighbor_forces = get_neighbor_forces(neighbor_forces, self.number_agents,
+        neighbor_forces, self.contacts = get_neighbor_forces(neighbor_forces, self.number_agents, self.contacts,
                                              self.locations, self.locations_corners, self.radii, self.center)
-        gravity_forces = np.zeros((self.number_agents, 2))
-        gravity_forces = get_gravity_forces(self.number_agents, self.locations, self.center, 300, gravity_forces)
+        # gravity_forces = np.zeros((self.number_agents, 2))
+        # gravity_forces = get_gravity_forces(self.number_agents, self.locations, self.center, 300, gravity_forces)
         #average_position = np.mean(self.locations, axis = 0)
         #direction = self.locations - image_center
         #norm_direction = direction/np.linalg.norm(direction, axis=1, keepdims=True)
-        neighbor_forces = (neighbor_forces * .5) + 1 * gravity_forces
-        noise_vector = 3 * np.random.uniform(-1, 1, (self.number_agents, 2))
+        #neighbor_forces = (neighbor_forces * .5) + 1 * gravity_forces
+        noise_vector = np.random.normal(0, 1, (self.number_agents, 2))
 
-        # (ri/r)sqrt(
+        # (ri/r)sqrt(S
 
         time_step = 1
 
-        self.locations += time_step * (2 * self.radii.reshape((self.number_agents, 1))) * self.velocity * (
+        self.locations += time_step * (self.radii.reshape((self.number_agents, 1))) * self.velocity * (
                     neighbor_forces + noise_vector)
         #check that the new location is within the space, otherwise use boundary values
         self.locations = np.where(self.locations > 300, 300, self.locations)
